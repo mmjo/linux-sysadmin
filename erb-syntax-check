@@ -1,0 +1,2 @@
+#!/bin/sh
+erb -P -x -T '-' "${1:--}" | ruby -c
