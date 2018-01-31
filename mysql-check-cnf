@@ -1,0 +1,515 @@
+#!/bin/bash
+## (c) Mike Jonkmans
+## License: GPL v3
+## Disclaimer: Use at your own risk.
+##
+## See also: http://dev.mysql.com/doc/refman/5.5/en/mysqld-option-tables.html
+##
+## Maybe useful:
+## Show variables, with cnf's and without:
+##	mysqld --verbose --help
+##	mysqld --no-defaults --verbose --help
+## Active variables can be retrieved with 'SHOW VARIABLES'
+
+PROG="${0##*/}"
+
+## Minimum (tested) mysql version is 5.5.40
+## Can be overriden by environment setting.
+: ${MYSQL_VERSION:=5.5.40}
+
+shopt -s extglob
+main () {
+	case "$1" in
+	'queries') generate_queries ;;
+	'sets') generate_sets ;;
+	'-h'|'--help') usage ;;
+	*) usage; exit 2 ;;
+	esac
+}
+
+usage () {
+	echo 'Usage:'
+	echo "  $PROG -h|--help|queries|sets"
+	echo
+	echo 'Overall purpose is to have no downtime for mysql.'
+	echo '  By generating mysql SET statements,'
+	echo '  that sets the actual dynamic server variables,'
+	echo '  according to the settings found in the .cnf files.'
+	echo 'A complete pipeline would be:'
+	echo "  $PROG queries </etc/my.cnf | mysql -Bs | $PROG sets # | mysql -Bs"
+	echo "  the last mysql is commented, for safety"
+	echo
+	echo "$PROG queries"
+	echo '  Reads mysql config file as input (e.g. /etc/my.cnf).'
+	echo '  Generates select statements as input to mysql,'
+	echo '    that select the actual value of variables that are in the input,'
+	echo '    together with a select for the value specified in the .cnf file.'
+	echo '  E.g. an ouptut line lookes like:'
+	echo "    'select @@global.read_only, 0'"
+	echo "  The output of $PROG queries should be used as input to 'mysql -Bs'."
+	echo "  That mysql's ouptput is then to be used as input for '$PROG sets'."
+	echo
+	echo "$PROG sets"
+	echo "   Reads input generated from '$PROG queries </etc/my.cnf | mysql -Bs'."
+	echo '   Generates SET commands that modify the actual mysql settings.'
+	echo
+	echo 'ENVIRONMENT:'
+	echo '  MYSQL_VERSION: is used for checking availability of some variables'
+	echo "    actual value is $MYSQL_VERSION"
+	echo
+	echo 'CAVEATS:'
+	echo '  Some variables can not be set without downtime, e.g. bind_address.'
+	echo '  Some (yet) unknown variable names may result in mysql errors'
+	echo '  Includes in the (.cnf) input are not handled.'
+}
+
+## Generate set commands for dynamic server variables from input.
+generate_sets () {
+	local var actual wanted dec frac retval=0
+	while read var actual wanted; do
+		type='integer'
+		case "$actual" in
+		'OFF') actual=0 ;;
+		'ON') actual=1 ;;
+		+([0-9])) ;;
+		+([0-9]).+([0-9])) type='float' ;;
+		*) type='string' ;;
+		esac
+
+		if [ "$type" = 'float' ]; then
+			dec=${actual%.*} frac=${actual#*.}
+			(( wanted * 10**${#frac} - $dec$frac == 0 )) && continue
+		else 
+			[ x"$actual" = x"$wanted" ] && continue
+		fi
+
+		if is_dynamic_var "$var"; then
+			case $type in
+			'integer'|'float') echo "SET @@global.$var $wanted" ;;
+			'string') echo "SET @@global.$var '$wanted'" ;;
+			esac
+		else
+			case $type in
+			integer) echo "/* $var is not dynamic, actual='$actual', wanted='$wanted' */" ;;
+			string) echo "/* $var is not dynamic, actual='$actual', wanted='$wanted' */" ;;
+			esac
+			retval=1
+		fi
+	done
+	return $retval
+}
+
+## Generate select queries for dynamic server variables from input.
+generate_queries () {
+	local section=other
+	while read a b c; do
+		## check the section, skip comments and empty lines
+		case "$a" in
+		''|'#'*) continue ;;
+		'[mysqld]'*|'[server]'*) section=mysqld; continue ;;
+		'['*) section=other ;;
+		esac
+		[ "$section" = 'mysqld' ] || continue
+		
+		if ! is_selectable_var "$a"; then
+			echo -n "/*"
+			echo -n $a $b $c
+			echo "*/"
+			continue
+		fi
+
+		## give default value of 1 to boolean options
+		case "$b" in '=') ;; *) c=1 ;; esac
+
+		## correct the value
+		case "${c^^}" in
+		[1-9]*([0-9])G) ((c = ${c/%[Gg]} * 1024**3)) ;;
+		[1-9]*([0-9])M) ((c = ${c/%[Mm]} * 1024**2)) ;;
+		[1-9]*([0-9])K) ((c = ${c/%[Kk]} * 1024)) ;;
+		+([0-9])) ;;
+		'OFF') c=0 ;;
+		'ON') c=1 ;;
+		*) c=\'$c\' ;;
+		esac
+
+		echo "select '$a', @@global.${a//-/_}, $c;"
+	done
+}
+
+is_selectable_var () {
+	case "${1//-/_}" in ## canonicalize names with _'s
+	abort_slave_event_count) return 1 ;;
+	allow_suspicious_udfs) return 1 ;;
+	ansi) return 1 ;;
+	audit_log) return 1 ;;
+	authentication_windows_log_level) return 1 ;;
+	authentication_windows_use_principal_name) return 1 ;;
+	bind_address) return 1 ;;
+	binlog_do_db) return 1 ;;
+	binlog_ignore_db) return 1 ;;
+	binlog_row_event_max_size) return 1 ;;
+	bootstrap) return 1 ;;
+	character_set_client_handshake) return 1 ;;
+	chroot) return 1 ;;
+	console) return 1 ;;
+	core_file) return 1 ;;
+	debug_sync_timeout) return 1 ;;
+	default_character_set) return 1 ;;
+	default_time_zone) return 1 ;;
+	defaults_extra_file) return 1 ;;
+	defaults_file) return 1 ;;
+	defaults_group_suffix) return 1 ;;
+	des_key_file) return 1 ;;
+	disconnect_slave_event_count) return 1 ;;
+	enable_locking) return 1 ;;
+	enable_named_pipe) return 1 ;;
+	enable_pstack) return 1 ;;
+	exit_info) return 1 ;;
+	external_locking) return 1 ;;
+	federated) return 1 ;;
+	gdb) return 1 ;;
+	help) return 1 ;;
+	init_rpl_role) return 1 ;;
+	innodb) return 1 ;;
+	innodb_status_file) return 1 ;;
+	install) return 1 ;;
+	install_manual) return 1 ;;
+	local_service) return 1 ;;
+	log_bin_index) return 1 ;;
+	log_isam) return 1 ;;
+	log_short_format) return 1 ;;
+	log_slow_admin_statements) return 1 ;;
+	log_slow_slave_statements) return 1 ;;
+	log_tc) return 1 ;;
+	log_tc_size) return 1 ;;
+	master_connect_retry) return 1 ;;
+	master_host) return 1 ;;
+	master_info_file) return 1 ;;
+	master_password) return 1 ;;
+	master_port) return 1 ;;
+	master_retry_count) return 1 ;;
+	master_ssl) return 1 ;;
+	master_ssl_ca) return 1 ;;
+	master_ssl_capath) return 1 ;;
+	master_ssl_cert) return 1 ;;
+	master_ssl_cipher) return 1 ;;
+	master_ssl_key) return 1 ;;
+	master_user) return 1 ;;
+	max_binlog_dump_events) return 1 ;;
+	memlock) return 1 ;;
+	myisam_block_size) return 1 ;;
+	myisam_recover) return 1 ;;
+	ndb_connectstring) return 1 ;;
+	ndb_mgmd_host) return 1 ;;
+	ndb_report_thresh_binlog_epoch_slip) return 1 ;;
+	ndb_report_thresh_binlog_mem_usage) return 1 ;;
+	ndb_transid_mysql_connection_map) return 1 ;;
+	ndbcluster) return 1 ;;
+	no_defaults) return 1 ;;
+	old_style_user_limits) return 1 ;;
+	one_thread) return 1 ;;
+	partition) return 1 ;;
+	plugin) return 1 ;;
+	plugin_load) return 1 ;;
+	port_open_timeout) return 1 ;;
+	print_defaults) return 1 ;;
+	remove) return 1 ;;
+	replicate_do_db) return 1 ;;
+	replicate_do_table) return 1 ;;
+	replicate_ignore_db) return 1 ;;
+	replicate_ignore_table) return 1 ;;
+	replicate_rewrite_db) return 1 ;;
+	replicate_same_server_id) return 1 ;;
+	replicate_wild_do_table) return 1 ;;
+	replicate_wild_ignore_table) return 1 ;;
+	safe_mode) return 1 ;;
+	safe_show_database) return 1 ;;
+	safe_user_create) return 1 ;;
+	safemalloc_mem_limit) return 1 ;;
+	show_slave_auth_info) return 1 ;;
+	skip_character_set_client_handshake) return 1 ;;
+	skip_concurrent_insert) return 1 ;;
+	skip_event_scheduler) return 1 ;;
+	skip_grant_tables) return 1 ;;
+	skip_host_cache) return 1 ;;
+	skip_locking) return 1 ;;
+	skip_ndbcluster) return 1 ;;
+	skip_new) return 1 ;;
+	skip_partition) return 1 ;;
+	skip_safemalloc) return 1 ;;
+	skip_slave_start) return 1 ;;
+	skip_ssl) return 1 ;;
+	skip_stack_trace) return 1 ;;
+	skip_symbolic_links) return 1 ;;
+	skip_symlink) return 1 ;;
+	skip_thread_priority) return 1 ;;
+	slow_start_timeout) return 1 ;;
+	sporadic_binlog_dump_fail) return 1 ;;
+	ssl) return 1 ;;
+	standalone) return 1 ;;
+	super_large_pages) return 1 ;;
+	symbolic_links) return 1 ;;
+	sysdate_is_now) return 1 ;;
+	tc_heuristic_recover) return 1 ;;
+	temp_pool) return 1 ;;
+	transaction_isolation) return 1 ;;
+	user) return 1 ;;
+	verbose) return 1 ;;
+	*) return 0 ;;
+	esac
+}
+
+## True iff the (selectable) server variable can be set at runtime
+is_dynamic_var () {
+	case "${1//-/_}" in ## canonicalize names with _'s
+	auto_increment_increment) return 0 ;;
+	auto_increment_offset) return 0 ;;
+	autocommit) return 0 ;;
+	automatic_sp_privileges) return 0 ;;
+	big_tables) return 0 ;;
+	binlog_cache_size) return 0 ;;
+	binlog_direct_non_transactional_updates) return 0 ;;
+	binlog_format) return 0 ;;
+	binlog_stmt_cache_size) return 0 ;;
+	bulk_insert_buffer_size) return 0 ;;
+	character_set_client) return 0 ;;
+	character_set_connection) return 0 ;;
+	character_set_database) return 0 ;;
+	character_set_filesystem) return 0 ;;
+	character_set_results) return 0 ;;
+	character_set_server) return 0 ;;
+	collation_connection) return 0 ;;
+	collation_database) return 0 ;;
+	collation_server) return 0 ;;
+	completion_type) return 0 ;;
+	concurrent_insert) return 0 ;;
+	connect_timeout) return 0 ;;
+	debug) return 0 ;;
+	default_storage_engine) return 0 ;;
+	default_week_format) return 0 ;;
+	delay_key_write) return 0 ;;
+	delayed_insert_limit) return 0 ;;
+	delayed_insert_timeout) return 0 ;;
+	delayed_queue_size) return 0 ;;
+	div_precision_increment) return 0 ;;
+	engine_condition_pushdown) mysql_version_check -lt 5.6; return ;;
+	event_scheduler) return 0 ;;
+	expire_logs_days) return 0 ;;
+	flush) return 0 ;;
+	flush_time) return 0 ;;
+	foreign_key_checks) return 0 ;;
+	ft_boolean_syntax) return 0 ;;
+	general_log) return 0 ;;
+	general_log_file) return 0 ;;
+	group_concat_max_len) return 0 ;;
+	init_connect) return 0 ;;
+	init_slave) return 0 ;;
+	innodb_adaptive_flushing) return 0 ;;
+	innodb_adaptive_hash_index) return 0 ;;
+	innodb_autoextend_increment) return 0 ;;
+	innodb_change_buffering) return 0 ;;
+	innodb_change_buffering_debug) return 0 ;;
+	innodb_commit_concurrency) return 0 ;;
+	innodb_concurrency_tickets) return 0 ;;
+	innodb_fast_shutdown) return 0 ;;
+	innodb_file_format) return 0 ;;
+	innodb_file_format_check) return 0 ;;
+	innodb_file_format_max) return 0 ;;
+	innodb_file_per_table) return 0 ;;
+	innodb_flush_log_at_trx_commit) return 0 ;;
+	innodb_io_capacity) return 0 ;;
+	innodb_large_prefix) return 0 ;;
+	innodb_limit_optimistic_insert_debug) return 0 ;;
+	innodb_lock_wait_timeout) return 0 ;;
+	innodb_max_dirty_pages_pct) return 0 ;;
+	innodb_max_purge_lag) return 0 ;;
+	innodb_old_blocks_pct) return 0 ;;
+	innodb_old_blocks_time) return 0 ;;
+	innodb_print_all_deadlocks) return 0 ;;
+	innodb_purge_batch_size) return 0 ;;
+	innodb_random_read_ahead) return 0 ;;
+	innodb_read_ahead_threshold) return 0 ;;
+	innodb_replication_delay) return 0 ;;
+	innodb_rollback_segments) return 0 ;;
+	innodb_spin_wait_delay) return 0 ;;
+	innodb_stats_method) return 0 ;;
+	innodb_stats_on_metadata) return 0 ;;
+	innodb_stats_sample_pages) return 0 ;;
+	innodb_strict_mode) return 0 ;;
+	innodb_support_xa) return 0 ;;
+	innodb_sync_spin_loops) return 0 ;;
+	innodb_table_locks) return 0 ;;
+	innodb_thread_concurrency) return 0 ;;
+	innodb_thread_sleep_delay) return 0 ;;
+	innodb_trx_purge_view_update_only_debug) return 0 ;;
+	innodb_trx_rseg_n_slots_debug) return 0 ;;
+	interactive_timeout) return 0 ;;
+	join_buffer_size) return 0 ;;
+	keep_files_on_create) return 0 ;;
+	key_buffer_size) return 0 ;;
+	key_cache_age_threshold) return 0 ;;
+	key_cache_block_size) return 0 ;;
+	key_cache_division_limit) return 0 ;;
+	lc_messages) return 0 ;;
+	lc_time_names) return 0 ;;
+	local_infile) return 0 ;;
+	lock_wait_timeout) return 0 ;;
+	log) return 0 ;;
+	log_bin_trust_function_creators) return 0 ;;
+	log_output) return 0 ;;
+	log_queries_not_using_indexes) return 0 ;;
+	log_slow_queries) mysql_version_check -lt 5.6; return ;;
+	log_warnings) return 0 ;;
+	long_query_time) return 0 ;;
+	low_priority_updates) return 0 ;;
+	max_allowed_packet) return 0 ;;
+	max_binlog_cache_size) return 0 ;;
+	max_binlog_size) return 0 ;;
+	max_binlog_stmt_cache_size) return 0 ;;
+	max_connect_errors) return 0 ;;
+	max_connections) return 0 ;;
+	max_delayed_threads) return 0 ;;
+	max_error_count) return 0 ;;
+	max_heap_table_size) return 0 ;;
+	max_insert_delayed_threads) return 0 ;;
+	max_join_size) return 0 ;;
+	max_length_for_sort_data) return 0 ;;
+	max_prepared_stmt_count) return 0 ;;
+	max_relay_log_size) return 0 ;;
+	max_seeks_for_key) return 0 ;;
+	max_sort_length) return 0 ;;
+	max_sp_recursion_depth) return 0 ;;
+	max_tmp_tables) return 0 ;;
+	max_user_connections) return 0 ;;
+	max_write_lock_count) return 0 ;;
+	min_examined_row_limit) return 0 ;;
+	multi_range_count) return 0 ;;
+	myisam_data_pointer_size) return 0 ;;
+	myisam_max_sort_file_size) return 0 ;;
+	myisam_repair_threads) return 0 ;;
+	myisam_sort_buffer_size) return 0 ;;
+	myisam_stats_method) return 0 ;;
+	myisam_use_mmap) return 0 ;;
+	ndb_autoincrement_prefetch_sz) return 0 ;;
+	ndb_blob_read_batch_bytes) return 0 ;;
+	ndb_blob_write_batch_bytes) return 0 ;;
+	ndb_cache_check_time) return 0 ;;
+	ndb_eventbuffer_max_alloc) return 0 ;;
+	ndb_extra_logging) return 0 ;;
+	ndb_force_send) return 0 ;;
+	ndb_index_stat_cache_entries) return 0 ;;
+	ndb_index_stat_enable) return 0 ;;
+	ndb_index_stat_option) return 0 ;;
+	ndb_index_stat_update_freq) return 0 ;;
+	ndb_log_bin) return 0 ;;
+	ndb_log_binlog_index) return 0 ;;
+	ndb_log_empty_epochs) return 0 ;;
+	ndb_log_update_as_write) return 0 ;;
+	ndb_log_updated_only) return 0 ;;
+	ndb_use_transactions) return 0 ;;
+	ndbinfo_max_bytes) return 0 ;;
+	ndbinfo_max_rows) return 0 ;;
+	ndbinfo_show_hidden) return 0 ;;
+	ndbinfo_table_prefix) return 0 ;;
+	net_buffer_length) return 0 ;;
+	net_read_timeout) return 0 ;;
+	net_retry_count) return 0 ;;
+	net_write_timeout) return 0 ;;
+	new) return 0 ;;
+	old_alter_table) return 0 ;;
+	old_passwords) return 0 ;;
+	optimizer_prune_level) return 0 ;;
+	optimizer_search_depth) return 0 ;;
+	optimizer_switch) return 0 ;;
+	preload_buffer_size) return 0 ;;
+	profiling) return 0 ;;
+	profiling_history_size) return 0 ;;
+	query_alloc_block_size) return 0 ;;
+	query_cache_limit) return 0 ;;
+	query_cache_min_res_unit) return 0 ;;
+	query_cache_size) return 0 ;;
+	query_cache_type) return 0 ;;
+	query_cache_wlock_invalidate) return 0 ;;
+	query_prealloc_size) return 0 ;;
+	range_alloc_block_size) return 0 ;;
+	read_buffer_size) return 0 ;;
+	read_only) return 0 ;;
+	read_rnd_buffer_size) return 0 ;;
+	relay_log_purge) return 0 ;;
+	relay_log_recovery) return 0 ;;
+	secure_auth) return 0 ;;
+	server_id) return 0 ;;
+	slave_allow_batching) return 0 ;;
+	slave_compressed_protocol) return 0 ;;
+	slave_exec_mode) return 0 ;;
+	slave_max_allowed_packet) return 0 ;;
+	slave_net_timeout) return 0 ;;
+	slave_transaction_retries) return 0 ;;
+	slow_launch_time) return 0 ;;
+	slow_query_log) return 0 ;;
+	slow_query_log_file) return 0 ;;
+	sort_buffer_size) return 0 ;;
+	sql_auto_is_null) return 0 ;;
+	sql_big_selects) return 0 ;;
+	sql_buffer_result) return 0 ;;
+	sql_log_bin) return 0 ;;
+	sql_log_off) return 0 ;;
+	sql_mode) return 0 ;;
+	sql_notes) return 0 ;;
+	sql_quote_show_create) return 0 ;;
+	sql_safe_updates) return 0 ;;
+	sql_select_limit) return 0 ;;
+	sql_slave_skip_counter) return 0 ;;
+	sql_warnings) return 0 ;;
+	storage_engine) return 0 ;;
+	stored_program_cache) return 0 ;;
+	sync_binlog) return 0 ;;
+	sync_frm) return 0 ;;
+	sync_master_info) return 0 ;;
+	sync_relay_log) return 0 ;;
+	sync_relay_log_info) return 0 ;;
+	table_definition_cache) return 0 ;;
+	table_lock_wait_timeout) return 0 ;;
+	table_open_cache) return 0 ;;
+	thread_cache_size) return 0 ;;
+	thread_pool_high_priority_connection) return 0 ;;
+	thread_pool_max_unused_threads) return 0 ;;
+	thread_pool_prio_kickup_timer) return 0 ;;
+	thread_pool_stall_limit) return 0 ;;
+	time_zone) return 0 ;;
+	timed_mutexes) return 0 ;;
+	tmp_table_size) return 0 ;;
+	transaction_alloc_block_size) return 0 ;;
+	transaction_prealloc_size) return 0 ;;
+	tx_isolation) return 0 ;;
+	unique_checks) return 0 ;;
+	updatable_views_with_limit) return 0 ;;
+	wait_timeout) return 0 ;;
+	esac
+	return 1
+}
+
+## Echo a number corresponding to a mysql version string ($1).
+## 5.6.1 => 500060001 (= 5 * 100000000 + 6 * 10000 + 1)
+## 5.5 => 500050000
+mysql_version_num () (
+	local vn=0 factor=100000000
+	IFS=.
+	for i in $1; do
+		(( vn += factor * $i, factor /= 10000 ))
+	done
+	echo $vn
+)
+
+## Compare $MYSQL_VERSION to $2, using comparison operator $1,
+## as in test (-lt, -ge, etc.)
+mysql_version_check () {
+	local cmp="$1" vers="$2" vn
+	if [ x$MYSQL_VERSION_NUM = x ]; then
+		MYSQL_VERSION_NUM=`mysql_version_num "$MYSQL_VERSION"`
+	fi
+	vn=`mysql_version_num "$vers"`
+	[ $MYSQL_VERSION_NUM $cmp $vn ]
+}
+
+main "$@"
